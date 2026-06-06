@@ -650,18 +650,18 @@ class WavRecorder:
     ** เปิด/อ่าน/ปิด PortAudio ในเธรดเดียวกันทั้งหมด เพื่อกันแครช **"""
 
     def __init__(self, dev, path):
-        self.dev = dev          # dict: index, name, rate, channels
+        self.dev = dev
         self.path = path
         self.running = False
         self.thread = None
         self._ready = threading.Event()
-        self.t_first = None     # เวลา (monotonic) ที่ได้เสียงก้อนแรก — ใช้จูนซิงก์
+        self.t_first = None     # เวลา (monotonic) ที่ได้เสียงก้อนแรก
 
     def start(self):
         self.running = True
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
-        self._ready.wait(timeout=2)   # รอให้เปิดสตรีมก่อนสักครู่
+        self._ready.wait(timeout=2)
 
     def _run(self):
         import wave
@@ -669,12 +669,10 @@ class WavRecorder:
         p = stream = wf = None
         try:
             ch = max(1, int(self.dev.get("channels", 2)))
-            rate = int(self.dev.get("rate", 44100))
+            rate = int(self.dev.get("rate", 48000))
             p = pyaudio.PyAudio()
             wf = wave.open(self.path, "wb")
-            wf.setnchannels(ch)
-            wf.setsampwidth(2)            # 16-bit
-            wf.setframerate(rate)
+            wf.setnchannels(ch); wf.setsampwidth(2); wf.setframerate(rate)
             stream = p.open(
                 format=pyaudio.paInt16, channels=ch, rate=rate,
                 frames_per_buffer=1024, input=True,
@@ -748,20 +746,19 @@ def list_audio_devices():
 
 
 class Recorder:
-    """อัดวิดีโอด้วย FFmpeg (ไม่มีเสียง) + อัดเสียงด้วย WASAPI แล้วรวมเป็นไฟล์เดียว
-    รองรับ พัก/อัดต่อ (แบ่งเป็นคลิปย่อยแล้วต่อกันตอนหยุด)"""
+    """อัดวิดีโอด้วย FFmpeg + อัดเสียงด้วย WASAPI แล้วรวมเป็นไฟล์เดียว
+    วัดออฟเซ็ตเริ่มต้นอัตโนมัติ + ให้ผู้ใช้จูนเพิ่มได้ (sync_ms)"""
 
     def __init__(self, ffmpeg):
         self.ffmpeg = ffmpeg
         self.proc = None
-        self.clips = []        # [{video, sys, mic}]
+        self.clips = []
         self.idx = 0
         self.tmp_dir = None
         self.settings = None
         self.is_active = False
-        self._audio = []       # WavRecorder ที่กำลังทำงานในคลิปปัจจุบัน
+        self._audio = []
 
-    # ---------- สร้างคำสั่งวิดีโอ (ไม่มีเสียง) ----------
     def build_video_cmd(self, out_path):
         s = self.settings
         cmd = [self.ffmpeg, "-y"]
@@ -799,7 +796,6 @@ class Recorder:
                     "-b:v", s["bitrate"]]
         else:
             cmd += ["-c:v", "libx264", "-preset", s["x264_preset"], "-crf", str(s["crf"])]
-
         cmd += ["-pix_fmt", "yuv420p", "-an", "-movflags", "+faststart", out_path]
         return cmd
 
@@ -808,7 +804,7 @@ class Recorder:
 
     def _start_clip(self):
         clip = {"video": os.path.join(self.tmp_dir, f"v_{self.idx:03d}.mp4"),
-                "sys": None, "mic": None, "t_video": None, "recs": []}
+                "sys": None, "mic": None, "t_video": None, "recs": [], "reader": None}
         cmd = self.build_video_cmd(clip["video"])
         log = self._log()
         log.write("\n\n=== " + " ".join(cmd) + "\n")
@@ -818,13 +814,16 @@ class Recorder:
             stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW,
         )
 
-        # อ่าน stderr ของ ffmpeg ตลอด (กันบัฟเฟอร์เต็มแล้ว ffmpeg ค้าง)
-        def _reader(proc, log):
+        def _reader(proc, clip, log):
+            tail = b""
             try:
                 while True:
-                    chunk = proc.stderr.read(1024)
+                    chunk = proc.stderr.read(512)
                     if not chunk:
                         break
+                    if clip.get("t_video") is None and b"frame=" in (tail + chunk):
+                        clip["t_video"] = time.monotonic()
+                    tail = chunk[-16:]
                     try:
                         log.write(chunk.decode("utf-8", "ignore"))
                     except Exception:
@@ -836,12 +835,10 @@ class Recorder:
                     log.close()
                 except Exception:
                     pass
-        t = threading.Thread(target=_reader, args=(self.proc, log),
-                             daemon=True)
+        t = threading.Thread(target=_reader, args=(self.proc, clip, log), daemon=True)
         t.start()
         clip["reader"] = t
 
-        # เสียง
         self._audio = []
         s = self.settings
         if HAS_PYAUDIO:
@@ -863,13 +860,11 @@ class Recorder:
 
     def start(self, settings):
         self.settings = settings
-        # ลบโฟลเดอร์ชั่วคราวเก่าที่ค้างอยู่ (จากรอบก่อน/เวอร์ชันเก่า) ทิ้งก่อน
         try:
             for name in os.listdir(settings["out_dir"]):
                 if name.startswith(".tmp_rec_"):
-                    old = os.path.join(settings["out_dir"], name)
-                    if os.path.isdir(old):
-                        shutil.rmtree(old, ignore_errors=True)
+                    shutil.rmtree(os.path.join(settings["out_dir"], name),
+                                  ignore_errors=True)
         except Exception:
             pass
         self.tmp_dir = os.path.join(
@@ -881,7 +876,6 @@ class Recorder:
         self._start_clip()
 
     def _stop_clip(self):
-        # หยุดเสียงก่อน แล้วค่อยหยุดวิดีโอ
         for rec in self._audio:
             try:
                 rec.stop()
@@ -907,7 +901,6 @@ class Recorder:
         self._start_clip()
 
     def _mux_clip(self, clip, out_path):
-        """รวมวิดีโอกับเสียงของคลิปเดียว พร้อมจูนซิงก์ภาพ/เสียงให้ตรงกัน"""
         v = clip["video"]
         auds = [a for a in (clip.get("sys"), clip.get("mic"))
                 if a and os.path.exists(a) and os.path.getsize(a) > 1024]
@@ -915,13 +908,17 @@ class Recorder:
             shutil.copy(v, out_path)
             return
 
-        # จูนซิงก์เสียง/ภาพ ตามค่าที่ผู้ใช้ตั้งเอง (sync_ms: บวก = หน่วงเสียงให้ช้าลง)
+        # ซิงก์: วัดออฟเซ็ตอัตโนมัติ (เฟรมแรกภาพ - เสียงก้อนแรก) + ค่าปรับมือ
         ss_audio = ss_video = 0.0
-        d = self.settings.get("sync_ms", 0) / 1000.0
+        t_video = clip.get("t_video")
+        ts = [r.t_first for r in clip.get("recs", []) if r.t_first]
+        t_audio = min(ts) if ts else None
+        auto = (t_video - t_audio) if (t_video and t_audio) else 0.0
+        d = auto + self.settings.get("sync_ms", 0) / 1000.0
         if d > 0.01:
-            ss_audio = round(min(d, 10.0), 3)    # เสียงนำ -> ตัดต้นเสียง (หน่วงเสียง)
+            ss_audio = round(min(d, 10.0), 3)
         elif d < -0.01:
-            ss_video = round(min(-d, 10.0), 3)   # ภาพนำ -> ตัดต้นภาพ
+            ss_video = round(min(-d, 10.0), 3)
 
         cmd = [self.ffmpeg, "-y"]
         if ss_video:
@@ -931,7 +928,6 @@ class Recorder:
             if ss_audio:
                 cmd += ["-ss", f"{ss_audio:.3f}"]
             cmd += ["-i", a]
-
         if len(auds) == 1:
             cmd += ["-map", "0:v", "-map", "1:a"]
         else:
@@ -940,25 +936,25 @@ class Recorder:
             cmd += ["-filter_complex", mix, "-map", "0:v", "-map", "[a]"]
         cmd += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
                 "-shortest", "-movflags", "+faststart", out_path]
-        logf = open(os.path.join(self.tmp_dir, "ffmpeg.log"), "a", encoding="utf-8")
+        logf = self._log()
         try:
-            logf.write(f"\n\n=== MUX (ss_audio={ss_audio} ss_video={ss_video}) "
-                       + " ".join(cmd) + "\n")
+            logf.write("\n\n=== MUX " + " ".join(cmd) + "\n")
             subprocess.run(cmd, stdout=logf, stderr=logf,
                            creationflags=CREATE_NO_WINDOW)
         finally:
-            logf.close()
+            try:
+                logf.close()
+            except Exception:
+                pass
 
     def stop(self, final_path):
         self.is_active = False
         self._stop_clip()
-
-        # รอ thread อ่าน log ของทุกคลิปปิดไฟล์ให้เรียบร้อย (กันลบโฟลเดอร์ไม่ออก)
-        for clip in self.clips:
-            t = clip.get("reader")
-            if t:
+        for c in self.clips:
+            th = c.get("reader")
+            if th:
                 try:
-                    t.join(timeout=3)
+                    th.join(timeout=3)
                 except Exception:
                     pass
 
@@ -1190,21 +1186,34 @@ class App(ctk.CTk):
         ).pack(fill="x", pady=(0, 10))
 
         # -- ปรับซิงก์เสียง --
+        self._sync_ms = 0   # ค่าจริง (แม่นระดับ ms) ใช้ตอนรวมไฟล์
         sync_row = ctk.CTkFrame(card, fg_color="transparent")
         sync_row.pack(fill="x")
         ctk.CTkLabel(sync_row, text="ปรับซิงก์เสียง", font=(UI_FONT, 14)).pack(side="left")
+        ctk.CTkButton(
+            sync_row, text="−1 เฟรม", width=64, command=lambda: self._nudge_sync(-1),
+            fg_color="#26262F", hover_color="#33333F", font=(UI_FONT, 12),
+        ).pack(side="left", padx=(10, 4))
+        ctk.CTkButton(
+            sync_row, text="+1 เฟรม", width=64, command=lambda: self._nudge_sync(1),
+            fg_color="#26262F", hover_color="#33333F", font=(UI_FONT, 12),
+        ).pack(side="left")
+        ctk.CTkButton(
+            sync_row, text="รีเซ็ต", width=52, command=self._reset_sync,
+            fg_color="#26262F", hover_color="#33333F", font=(UI_FONT, 12),
+        ).pack(side="left", padx=(4, 0))
         self.sync_val_lbl = ctk.CTkLabel(
             sync_row, text="0 ms", font=(UI_FONT, 14), text_color=ACCENT)
         self.sync_val_lbl.pack(side="right")
         self.sync_slider = ctk.CTkSlider(
-            card, from_=-3000, to=3000, number_of_steps=120,
+            card, from_=-3000, to=3000, number_of_steps=600,
             command=self._on_sync_change,
             progress_color=ACCENT, button_color=ACCENT, button_hover_color=ACCENT_HOVER,
         )
         self.sync_slider.set(0)
         self.sync_slider.pack(fill="x", pady=(2, 2))
         ctk.CTkLabel(
-            card, text="เลื่อนขวา = หน่วงเสียงให้ช้าลง (ใช้เมื่อเสียงมาก่อนภาพ) • ±3 วินาที",
+            card, text="ปรับซิงก์อัตโนมัติทุกครั้งอยู่แล้ว • ใช้ปุ่ม/สไลเดอร์จูนเพิ่มถ้ายังเหลื่อมเล็กน้อย",
             font=(UI_FONT, 11), text_color=TXT_DIM,
         ).pack(anchor="w", pady=(0, 12))
 
@@ -1317,8 +1326,9 @@ class App(ctk.CTk):
              else self.border_switch.deselect)()
 
             if c.get("sync_ms") is not None:
-                self.sync_slider.set(c["sync_ms"])
-                self.sync_val_lbl.configure(text=f"{int(c['sync_ms'])} ms")
+                self._sync_ms = int(c["sync_ms"])
+                self.sync_slider.set(self._sync_ms)
+                self.sync_val_lbl.configure(text=f"{self._sync_ms} ms")
 
             od = c.get("out_dir")
             if od:
@@ -1347,7 +1357,7 @@ class App(ctk.CTk):
                 "mic_on": bool(self.mic_switch.get()),
                 "mic_dev": self.mic_menu.get(),
                 "border": bool(self.border_switch.get()),
-                "sync_ms": int(round(self.sync_slider.get())),
+                "sync_ms": int(self._sync_ms),
                 "out_dir": self.out_entry.get().strip().strip('"') or self.out_dir,
                 "area": "region" if self.region else "full",
                 "region": list(self.region) if self.region else None,
@@ -1477,7 +1487,24 @@ class App(ctk.CTk):
         self.mic_menu.configure(state="normal" if self.mic_switch.get() else "disabled")
 
     def _on_sync_change(self, value):
-        self.sync_val_lbl.configure(text=f"{int(round(value))} ms")
+        self._sync_ms = int(round(value))
+        self.sync_val_lbl.configure(text=f"{self._sync_ms} ms")
+
+    def _nudge_sync(self, direction):
+        """ปรับซิงก์ทีละ 1 เฟรม ตามเฟรมเรตที่เลือก (ละเอียดกว่าสไลเดอร์)"""
+        try:
+            fps = int(self.fps_menu.get().split()[0])
+        except Exception:
+            fps = 60
+        frame_ms = max(1, round(1000 / fps))
+        self._sync_ms = max(-3000, min(3000, self._sync_ms + direction * frame_ms))
+        self.sync_slider.set(self._sync_ms)   # ขยับสไลเดอร์ตาม (ไม่ trigger callback)
+        self.sync_val_lbl.configure(text=f"{self._sync_ms} ms")
+
+    def _reset_sync(self):
+        self._sync_ms = 0
+        self.sync_slider.set(0)
+        self.sync_val_lbl.configure(text="0 ms")
 
     def _choose_dir(self):
         d = filedialog.askdirectory(initialdir=self.out_dir)
@@ -1546,7 +1573,7 @@ class App(ctk.CTk):
             "sys_dev": sys_dev,
             "mic_dev": mic_dev,
             "out_dir": self.out_dir,
-            "sync_ms": int(round(self.sync_slider.get())),
+            "sync_ms": int(self._sync_ms),
         }
 
     def _on_rec_btn(self):
